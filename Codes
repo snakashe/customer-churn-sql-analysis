@@ -1,0 +1,267 @@
+-- ================================================================
+-- STEP 1: CREATE TABLE & LOAD DATA
+-- ================================================================
+
+CREATE TABLE customer_churn (
+    RowNumber        INT,
+    CustomerId       BIGINT PRIMARY KEY,
+    Surname          VARCHAR(100),
+    CreditScore      INT,
+    Geography        VARCHAR(50),
+    Gender           VARCHAR(10),
+    Age              INT,
+    Tenure           INT,
+    Balance          DECIMAL(15,2),
+    NumOfProducts    INT,
+    HasCrCard        TINYINT,
+    IsActiveMember   TINYINT,
+    EstimatedSalary  DECIMAL(15,2),
+    Exited           TINYINT,       -- 1 = churned, 0 = retained
+    Complain         TINYINT,       -- 1 = has complaint
+    SatisfactionScore INT,
+    CardType         VARCHAR(20),
+    PointEarned      INT
+);
+
+-- Load the CSV (adjust path as needed)
+LOAD DATA INFILE '/path/to/Customer-Churn-Records.csv'
+INTO TABLE customer_churn
+FIELDS TERMINATED BY ','
+ENCLOSED BY '"'
+LINES TERMINATED BY '\n'
+IGNORE 1 ROWS;
+
+
+-- ================================================================
+-- STEP 2: CUSTOMER VALUE SEGMENTATION
+-- CASE WHEN on balance + salary + credit score
+-- ================================================================
+
+SELECT
+    CustomerId,
+    Surname,
+    Geography,
+    Gender,
+    CreditScore,
+    Balance,
+    EstimatedSalary,
+    CASE
+        WHEN Balance >= 100000 AND CreditScore >= 700 THEN 'Premium'
+        WHEN Balance >= 50000  AND CreditScore >= 600 THEN 'Standard'
+        ELSE                                               'Basic'
+    END                                                AS customer_tier,
+    CASE
+        WHEN Exited = 1 THEN 'Churned'
+        ELSE                 'Retained'
+    END                                                AS churn_status
+FROM customer_churn
+ORDER BY Balance DESC;
+
+
+-- ================================================================
+-- STEP 3: CHURN RATE BY GEOGRAPHY & GENDER
+-- GROUP BY + CASE WHEN + ROUND
+-- ================================================================
+
+SELECT
+    Geography,
+    Gender,
+    COUNT(*)                                           AS total_customers,
+    SUM(Exited)                                        AS churned,
+    COUNT(*) - SUM(Exited)                             AS retained,
+    ROUND(SUM(Exited) * 100.0 / COUNT(*), 2)           AS churn_rate_pct
+FROM customer_churn
+GROUP BY Geography, Gender
+ORDER BY churn_rate_pct DESC;
+
+
+-- ================================================================
+-- STEP 4: CHURN RATE BY CARD TYPE & SATISFACTION SCORE
+-- Identifying which card types retain customers best
+-- ================================================================
+
+SELECT
+    CardType,
+    SatisfactionScore,
+    COUNT(*)                                           AS total_customers,
+    SUM(Exited)                                        AS churned,
+    ROUND(SUM(Exited) * 100.0 / COUNT(*), 2)           AS churn_rate_pct,
+    ROUND(AVG(PointEarned), 1)                         AS avg_points_earned
+FROM customer_churn
+GROUP BY CardType, SatisfactionScore
+ORDER BY CardType, SatisfactionScore;
+
+
+-- ================================================================
+-- STEP 5: HIGH-RISK CHURNED CUSTOMERS
+-- Customers who churned AND have complaints AND low satisfaction
+-- Using WHERE + AND filters with CASE WHEN flags
+-- ================================================================
+
+SELECT
+    CustomerId,
+    Surname,
+    Geography,
+    Age,
+    CreditScore,
+    Balance,
+    SatisfactionScore,
+    CardType,
+    CASE
+        WHEN Balance > 100000 THEN 'High Balance'
+        WHEN Balance > 50000  THEN 'Mid Balance'
+        ELSE                       'Low Balance'
+    END                                                AS balance_tier,
+    CASE
+        WHEN CreditScore < 500 THEN 'Poor'
+        WHEN CreditScore < 650 THEN 'Fair'
+        WHEN CreditScore < 750 THEN 'Good'
+        ELSE                        'Excellent'
+    END                                                AS credit_tier
+FROM customer_churn
+WHERE Exited = 1
+  AND Complain = 1
+  AND SatisfactionScore <= 2
+ORDER BY Balance DESC;
+
+
+-- ================================================================
+-- STEP 6: PRODUCT HOLDING vs CHURN ANALYSIS
+-- Do customers with more products churn less?
+-- GROUP BY + HAVING
+-- ================================================================
+
+SELECT
+    NumOfProducts,
+    COUNT(*)                                           AS total_customers,
+    SUM(Exited)                                        AS churned,
+    ROUND(SUM(Exited) * 100.0 / COUNT(*), 2)           AS churn_rate_pct,
+    ROUND(AVG(Balance), 2)                             AS avg_balance,
+    ROUND(AVG(CreditScore), 1)                         AS avg_credit_score
+FROM customer_churn
+GROUP BY NumOfProducts
+HAVING COUNT(*) > 10
+ORDER BY churn_rate_pct DESC;
+
+
+-- ================================================================
+-- STEP 7: WINDOW FUNCTIONS — RANKING CUSTOMERS BY BALANCE
+-- Within each geography, rank customers by balance
+-- ROW_NUMBER, RANK, DENSE_RANK, NTILE
+-- ================================================================
+
+SELECT
+    CustomerId,
+    Surname,
+    Geography,
+    Balance,
+    CreditScore,
+    Exited,
+    ROW_NUMBER() OVER (
+        PARTITION BY Geography
+        ORDER BY Balance DESC
+    )                                                  AS balance_rank,
+    NTILE(4) OVER (
+        PARTITION BY Geography
+        ORDER BY Balance DESC
+    )                                                  AS balance_quartile,
+    ROUND(AVG(Balance) OVER (
+        PARTITION BY Geography
+    ), 2)                                              AS avg_balance_by_region
+FROM customer_churn
+ORDER BY Geography, balance_rank;
+
+
+-- ================================================================
+-- STEP 8: CTE — CHURN RISK SCORING MODEL
+-- Combines multiple risk signals into a composite score
+-- ================================================================
+
+WITH risk_signals AS (
+    SELECT
+        CustomerId,
+        Surname,
+        Geography,
+        CardType,
+        SatisfactionScore,
+        -- each flag adds to a risk score
+        CASE WHEN Exited        = 1 THEN 3 ELSE 0 END +
+        CASE WHEN Complain      = 1 THEN 2 ELSE 0 END +
+        CASE WHEN IsActiveMember= 0 THEN 2 ELSE 0 END +
+        CASE WHEN SatisfactionScore <= 2 THEN 2 ELSE 0 END +
+        CASE WHEN CreditScore   < 600 THEN 1 ELSE 0 END +
+        CASE WHEN Balance       = 0   THEN 1 ELSE 0 END  AS risk_score
+    FROM customer_churn
+),
+risk_categorized AS (
+    SELECT
+        *,
+        CASE
+            WHEN risk_score >= 7 THEN 'Critical'
+            WHEN risk_score >= 5 THEN 'High'
+            WHEN risk_score >= 3 THEN 'Medium'
+            ELSE                      'Low'
+        END                                            AS risk_category
+    FROM risk_signals
+)
+SELECT
+    risk_category,
+    COUNT(*)                                           AS total_customers,
+    ROUND(AVG(SatisfactionScore), 2)                   AS avg_satisfaction,
+    Geography,
+    CardType
+FROM risk_categorized
+GROUP BY risk_category, Geography, CardType
+ORDER BY
+    CASE risk_category
+        WHEN 'Critical' THEN 1
+        WHEN 'High'     THEN 2
+        WHEN 'Medium'   THEN 3
+        ELSE                 4
+    END,
+    Geography;
+
+
+-- ================================================================
+-- STEP 9: TENURE COHORT ANALYSIS
+-- How does churn vary by how long a customer has been with the bank?
+-- ================================================================
+
+SELECT
+    CASE
+        WHEN Tenure BETWEEN 0 AND 2  THEN '0-2 years'
+        WHEN Tenure BETWEEN 3 AND 5  THEN '3-5 years'
+        WHEN Tenure BETWEEN 6 AND 8  THEN '6-8 years'
+        ELSE                              '9+ years'
+    END                                                AS tenure_cohort,
+    COUNT(*)                                           AS total_customers,
+    SUM(Exited)                                        AS churned,
+    ROUND(SUM(Exited) * 100.0 / COUNT(*), 2)           AS churn_rate_pct,
+    ROUND(AVG(SatisfactionScore), 2)                   AS avg_satisfaction,
+    ROUND(AVG(Balance), 2)                             AS avg_balance
+FROM customer_churn
+GROUP BY tenure_cohort
+ORDER BY churn_rate_pct DESC;
+
+
+-- ================================================================
+-- STEP 10: SUBQUERY — CUSTOMERS ABOVE AVERAGE BALANCE WHO CHURNED
+-- A common pattern to flag high-value lost customers
+-- ================================================================
+
+SELECT
+    CustomerId,
+    Surname,
+    Geography,
+    Balance,
+    CreditScore,
+    SatisfactionScore,
+    CardType
+FROM customer_churn
+WHERE Exited = 1
+  AND Balance > (
+      SELECT AVG(Balance)
+      FROM customer_churn
+      WHERE Exited = 0   -- compare against retained customers' avg balance
+  )
+ORDER BY Balance DESC;
