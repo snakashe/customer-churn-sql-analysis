@@ -21,6 +21,4 @@ patterns, segment customers by risk tier, and quantify retention signals.
 Bank customer churn dataset — 10,000 records with attributes including 
 credit score, geography, tenure, balance, complaints, and card type.
 
-## Files
-- `churn_analysis.sql` — full annotated SQL script
-- `Customer-Churn-Records.csv` — dataset
+
